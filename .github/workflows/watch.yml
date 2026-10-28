@@ -1,0 +1,74 @@
+name: Website watch
+
+# Checks theamateur.co.uk from outside the server, hourly. Public pages only,
+# no secrets. A failed run emails the owner (GitHub's own failure notice).
+
+on:
+  schedule:
+    - cron: "41 * * * *"
+    - cron: "7 3 1 * *"
+  workflow_dispatch:
+    inputs:
+      test_failure:
+        description: "Fail on purpose, to prove the alert email arrives"
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Check public pages and certificate
+        env:
+          TEST_FAILURE: ${{ inputs.test_failure || false }}
+        run: |
+          set -u
+          fail=0
+          check() {
+            for try in 1 2 3; do
+              code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$1" || true)
+              if [ "$code" = 200 ]; then echo "pass $1"; return 0; fi
+              [ "$try" -lt 3 ] && sleep 30
+            done
+            echo "FAIL $1 (no answer after 3 tries)"
+            return 1
+          }
+          check https://theamateur.co.uk/ || fail=1
+          check https://theamateur.co.uk/ai-journalism/ || fail=1
+
+          end=$(echo | timeout 20 openssl s_client -connect theamateur.co.uk:443 -servername theamateur.co.uk 2>/dev/null \
+            | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+          days=0
+          [ -n "$end" ] && days=$(( ( $(date -d "$end" +%s) - $(date +%s) ) / 86400 ))
+          if [ "$days" -ge 14 ]; then echo "pass certificate"; else echo "FAIL certificate (under 14 days left or unreadable)"; fail=1; fi
+
+          if [ "$TEST_FAILURE" = true ]; then echo "FAIL on purpose (alert test)"; fail=1; fi
+          exit "$fail"
+
+  # GitHub switches off schedules in a public repository after 60 days with no
+  # activity. A monthly heartbeat commit keeps the watch alive. It touches only
+  # HEARTBEAT, never this file, so failure emails still go to the owner.
+  heartbeat:
+    if: github.event.schedule == '7 3 1 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: write
+    steps:
+      - name: Commit a monthly heartbeat
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          sha=$(gh api "repos/$REPO/contents/HEARTBEAT" --jq .sha 2>/dev/null || true)
+          body=$(printf 'Last heartbeat %s\n' "$(date -u +%F)" | base64 -w0)
+          gh api -X PUT "repos/$REPO/contents/HEARTBEAT" -f message="Monthly heartbeat" -f content="$body" ${sha:+-f sha="$sha"} >/dev/null
+          echo "heartbeat written"
